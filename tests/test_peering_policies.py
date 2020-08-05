@@ -1,6 +1,6 @@
 from django.test import TestCase
 
-from scionlab.models.core import ISD
+from scionlab.models.core import BorderRouter, ISD
 from scionlab.models.user_as import UserAS
 
 from scionlab_ixp.models import ASPeerPolicy, ISDPeerPolicy, IXP, IXPLink, IXPMember
@@ -149,3 +149,66 @@ class PeeringPoliciesTest(TestCase):
         self.assertFalse(count1 > 1 and count2 > 1)
 
         return (count1 + count2) > 0
+
+
+class LinkBalancingTest(TestCase):
+    fixtures = ['testdata']
+    _MAX_PEERING_PER_BR = 2
+
+    def setUp(self):
+        # Create IXP
+        self.ixp = IXP.objects.create(label="ixp1", ip_network="10.1.1.0/24")
+
+        # Set user ASes as IXP members
+        self.ases = [UserAS.objects.get(as_id="ffaa:1:%d" % i) for i in range(1, 6)]
+        IXPMember.objects.create(ixp=self.ixp, host=self.ases[0].hosts.first(), public_ip="10.1.1.2")
+        IXPMember.objects.create(ixp=self.ixp, host=self.ases[1].hosts.first(), public_ip="10.1.1.3")
+        IXPMember.objects.create(ixp=self.ixp, host=self.ases[2].hosts.first(), public_ip="10.1.1.4")
+        IXPMember.objects.create(ixp=self.ixp, host=self.ases[3].hosts.first(), public_ip="10.1.1.5")
+        IXPMember.objects.create(ixp=self.ixp, host=self.ases[4].hosts.first(), public_ip="10.1.1.6")
+
+    def test_balance_links(self):
+        """Test the balancing of peering links over multiple border routers."""
+        for asys in self.ases[1:]:
+            ASPeerPolicy.objects.create(ixp=self.ixp, AS=asys, peer_as=self.ases[0], deny=False)
+
+        asys = self.ases[0]
+        self.assertEqual(1, BorderRouter.objects.filter(host=asys.host).count())
+
+        policy1 = self._add_as_policy(asys, self.ases[1], False)
+        self.assertEqual(2, BorderRouter.objects.filter(host=asys.host).count())
+
+        policy2 = self._add_as_policy(asys, self.ases[2], False)
+        self.assertEqual(2, BorderRouter.objects.filter(host=asys.host).count())
+
+        policy3 = self._add_as_policy(asys, self.ases[3], False)
+        self.assertEqual(3, BorderRouter.objects.filter(host=asys.host).count())
+
+        policy4 = self._add_as_policy(asys, self.ases[4], False)
+        self.assertEqual(3, BorderRouter.objects.filter(host=asys.host).count())
+
+        self._delete_policy(policy1)
+        self.assertEqual(3, BorderRouter.objects.filter(host=asys.host).count())
+
+        self._delete_policy(policy2)
+        self.assertEqual(2, BorderRouter.objects.filter(host=asys.host).count())
+
+        self._delete_policy(policy3)
+        self.assertEqual(2, BorderRouter.objects.filter(host=asys.host).count())
+
+        self._delete_policy(policy4)
+        self.assertEqual(1, BorderRouter.objects.filter(host=asys.host).count())
+
+    def _add_as_policy(self, asys, peer_as, deny):
+        """Add an AS peering policy and apply it.
+
+        :returns: The newly created policy instance.
+        """
+        policy = ASPeerPolicy.objects.create(ixp=self.ixp, AS=asys, peer_as=peer_as, deny=deny)
+        apply_peering_policy(asys, self.ixp, max_peering_per_br=self._MAX_PEERING_PER_BR)
+        return policy
+
+    def _delete_policy(self, policy):
+        """Delete a peering policy and apply the changes."""
+        policy.delete()
+        apply_peering_policy(policy.AS, self.ixp, max_peering_per_br=self._MAX_PEERING_PER_BR)
